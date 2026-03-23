@@ -1,17 +1,23 @@
-# Start with the official Go image
-FROM golang:1.22-alpine
+# Start from the official Go image
+FROM golang:1.21-alpine
 
-# Set our working directory inside the container
+# Set the working directory inside the container
 WORKDIR /app
 
-# Copy our main.go file into the container
-COPY main.go .
+# 🚨 THE FIX: Copy the module files FIRST
+COPY go.mod go.sum ./
 
-# Compile our server into a binary program
+# 🚨 THE FIX: Download all dependencies (like Gorilla WebSockets)
+RUN go mod download
+
+# Now copy the rest of your code (main.go)
+COPY . .
+
+# Build the application
 RUN go build -o server main.go
 
-# Expose the port
+# Expose the port Render uses
 EXPOSE 3001
 
-# Run our compiled server
+# Run the executable
 CMD ["./server"]
