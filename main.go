@@ -1,23 +1,19 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
 	"time"
-	"go/format"
+
+	"github.com/gorilla/websocket"
 )
 
-// Define the shape of our incoming and outgoing JSON
-type ExecuteRequest struct {
-	Code string `json:"code"`
-}
-
-type ExecuteResponse struct {
-	Output string `json:"output,omitempty"`
-	Error  string `json:"error,omitempty"`
+// Define the shape of our WebSocket messages
+type WSMessage struct {
+	Type string `json:"type"` // "start" (from React), "input" (from React), "output" (from Go), "error" (from Go), "exit" (from Go)
+	Data string `json:"data"` // The actual code, typed input, or terminal output
 }
 
 type FormatRequest struct {
@@ -29,7 +25,7 @@ type FormatResponse struct {
 	Error         string `json:"error,omitempty"`
 }
 
-// Helper function to allow your React app to talk to this server
+// Helper function for HTTP routes
 func enableCors(w *http.ResponseWriter) {
 	(*w).Header().Set("Access-Control-Allow-Origin", "*")
 	(*w).Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
@@ -42,110 +38,113 @@ func pingHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("Server is awake and ready!"))
 }
 
-// The core execution route
-func executeHandler(w http.ResponseWriter, r *http.Request) {
-	enableCors(&w)
-	
-	// Handle preflight requests from the browser
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
+// 🚨 THE UPGRADE: The WebSocket Upgrader
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true // Allow all origins for the sandbox
+	},
+}
 
-	// Read the JSON sent from React
-	var req ExecuteRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
-		return
-	}
-
-	// 1. Create a unique filename using a timestamp
-	fileName := fmt.Sprintf("temp_%d.go", time.Now().UnixNano())
-
-	// 2. Write the user's code to the file
-	err := os.WriteFile(fileName, []byte(req.Code), 0644)
+// 🚨 THE UPGRADE: The interactive execution route
+func wsExecuteHandler(w http.ResponseWriter, r *http.Request) {
+	// 1. Upgrade the standard HTTP request to a persistent WebSocket tunnel
+	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		json.NewEncoder(w).Encode(ExecuteResponse{Error: "Failed to create file on server."})
+		fmt.Println("WebSocket Upgrade Error:", err)
+		return
+	}
+	defer conn.Close()
+
+	// 2. Wait for the React frontend to send the "start" message with the code
+	var startMsg WSMessage
+	if err := conn.ReadJSON(&startMsg); err != nil || startMsg.Type != "start" {
+		conn.WriteJSON(WSMessage{Type: "error", Data: "Failed to receive start command."})
 		return
 	}
 
-	// 3. Defer tells Go to delete this file the moment this function finishes
+	// 3. Create a unique file for this session
+	fileName := fmt.Sprintf("temp_%d.go", time.Now().UnixNano())
+	os.WriteFile(fileName, []byte(startMsg.Data), 0644)
 	defer os.Remove(fileName)
 
-	// 4. Run the Go code
+	// 4. Prepare the Go Execution Command
 	cmd := exec.Command("go", "run", fileName)
-	
-	// CombinedOutput captures both standard output (fmt.Println) and standard error (compiler bugs)
-	out, err := cmd.CombinedOutput() 
 
-	response := ExecuteResponse{}
+	// 5. Create "Pipes" directly into the running program's brain
+	stdinPipe, _ := cmd.StdinPipe()
+	stdoutPipe, _ := cmd.StdoutPipe()
+	stderrPipe, _ := cmd.StderrPipe()
+
+	// 6. Start the program (do not wait for it to finish yet!)
+	if err := cmd.Start(); err != nil {
+		conn.WriteJSON(WSMessage{Type: "error", Data: "Failed to start compiler: " + err.Error()})
+		return
+	}
+
+	// 7. STREAM OUTPUT: Continuously read terminal output and send it to React
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			n, err := stdoutPipe.Read(buf)
+			if n > 0 {
+				conn.WriteJSON(WSMessage{Type: "output", Data: string(buf[:n])})
+			}
+			if err != nil {
+				break
+			}
+		}
+	}()
+
+	// 8. STREAM ERRORS: Continuously read compiler errors and send to React
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			n, err := stderrPipe.Read(buf)
+			if n > 0 {
+				conn.WriteJSON(WSMessage{Type: "error", Data: string(buf[:n])})
+			}
+			if err != nil {
+				break
+			}
+		}
+	}()
+
+	// 9. HANDLE INPUT: Listen for the user typing in React, and inject it into the Go program
+	go func() {
+		for {
+			var inMsg WSMessage
+			if err := conn.ReadJSON(&inMsg); err != nil {
+				// If the user closes the browser tab, kill the Go program immediately
+				cmd.Process.Kill()
+				break
+			}
+			if inMsg.Type == "input" {
+				// Inject the text, adding a newline so fmt.Scan knows they pressed Enter
+				stdinPipe.Write([]byte(inMsg.Data + "\n"))
+			}
+		}
+	}()
+
+	// 10. Wait for the program to naturally finish running
+	err = cmd.Wait()
 	if err != nil {
-		// If the code failed to compile or crashed, send the output as an error
-		response.Error = string(out) 
+		conn.WriteJSON(WSMessage{Type: "exit", Data: "\n[Process exited with an error]"})
 	} else {
-		// If it succeeded, send the output
-		response.Output = string(out)
+		conn.WriteJSON(WSMessage{Type: "exit", Data: "\n[Process finished successfully]"})
 	}
-
-	// 5. Send results back to React
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
 }
 
-// This format the code
-func formatCode(w http.ResponseWriter, r *http.Request) {
-	enableCors(&w)
-	
-		// Handle the preflight OPTIONS request from the browser
-	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	// Ensure it's a POST request
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-
-	// 3. Decode the incoming JSON from the frontend
-	var req FormatRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		json.NewEncoder(w).Encode(FormatResponse{Error: "Invalid JSON request"})
-		return
-	}
-
-	// 4. THE MAGIC: Pass the user's code through Go's official formatter
-	// format.Source takes a byte slice and returns the perfectly formatted byte slice
-	formatted, err := format.Source([]byte(req.Code))
-	
-	if err != nil {
-		// If the user wrote invalid Go code (missing a bracket, typo, etc.), 
-		// format.Source throws an error. We send that back to the frontend.
-		json.NewEncoder(w).Encode(FormatResponse{
-			Error: err.Error(),
-		})
-		return
-	}
-
-	// 5. Send the beautifully formatted code back to React!
-	json.NewEncoder(w).Encode(FormatResponse{
-		FormattedCode: string(formatted),
-	})
-}
 func main() {
-	// Render assigns a dynamic port, so we check for it
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "3001"
 	}
 
 	http.HandleFunc("/ping", pingHandler)
-	http.HandleFunc("/execute", executeHandler)
-	http.HandleFunc("/format", formatCode)
 
-	fmt.Printf("Go Executor running on port %s\n", port)
+	// 🚨 THE UPGRADE: The execute route is now a WebSocket connection
+	http.HandleFunc("/execute", wsExecuteHandler)
+
+	fmt.Printf("Go Engine running on port %s\n", port)
 	http.ListenAndServe(":"+port, nil)
 }
