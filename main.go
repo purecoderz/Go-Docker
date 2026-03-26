@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context" // 🚨 ADDED: Required for the timeout kill switch
 	"fmt"
 	"net/http"
 	"os"
@@ -38,14 +39,14 @@ func pingHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("Server is awake and ready!"))
 }
 
-// 🚨 THE UPGRADE: The WebSocket Upgrader
+// The WebSocket Upgrader
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
 		return true // Allow all origins for the sandbox
 	},
 }
 
-// 🚨 THE UPGRADE: The interactive execution route
+// The interactive execution route
 func wsExecuteHandler(w http.ResponseWriter, r *http.Request) {
 	// 1. Upgrade the standard HTTP request to a persistent WebSocket tunnel
 	conn, err := upgrader.Upgrade(w, r, nil)
@@ -67,21 +68,25 @@ func wsExecuteHandler(w http.ResponseWriter, r *http.Request) {
 	os.WriteFile(fileName, []byte(startMsg.Data), 0644)
 	defer os.Remove(fileName)
 
-	// 4. Prepare the Go Execution Command
-	cmd := exec.Command("go", "run", fileName)
+	// 🚨 4. THE BACKEND FIX: Create a 5-second timeout context
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-	// 5. Create "Pipes" directly into the running program's brain
+	// 🚨 5. THE BACKEND FIX: Attach the context to the command
+	cmd := exec.CommandContext(ctx, "go", "run", fileName)
+
+	// 6. Create "Pipes" directly into the running program's brain
 	stdinPipe, _ := cmd.StdinPipe()
 	stdoutPipe, _ := cmd.StdoutPipe()
 	stderrPipe, _ := cmd.StderrPipe()
 
-	// 6. Start the program (do not wait for it to finish yet!)
+	// 7. Start the program (do not wait for it to finish yet!)
 	if err := cmd.Start(); err != nil {
 		conn.WriteJSON(WSMessage{Type: "error", Data: "Failed to start compiler: " + err.Error()})
 		return
 	}
 
-	// 7. STREAM OUTPUT: Continuously read terminal output and send it to React
+	// 8. STREAM OUTPUT: Continuously read terminal output and send it to React
 	go func() {
 		buf := make([]byte, 1024)
 		for {
@@ -95,7 +100,7 @@ func wsExecuteHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// 8. STREAM ERRORS: Continuously read compiler errors and send to React
+	// 9. STREAM ERRORS: Continuously read compiler errors and send to React
 	go func() {
 		buf := make([]byte, 1024)
 		for {
@@ -109,13 +114,15 @@ func wsExecuteHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// 9. HANDLE INPUT: Listen for the user typing in React, and inject it into the Go program
+	// 10. HANDLE INPUT: Listen for the user typing in React, and inject it into the Go program
 	go func() {
 		for {
 			var inMsg WSMessage
 			if err := conn.ReadJSON(&inMsg); err != nil {
 				// If the user closes the browser tab, kill the Go program immediately
-				cmd.Process.Kill()
+				if cmd.Process != nil {
+					cmd.Process.Kill()
+				}
 				break
 			}
 			if inMsg.Type == "input" {
@@ -125,11 +132,17 @@ func wsExecuteHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// 10. Wait for the program to naturally finish running
+	// 🚨 11. WAIT & EVALUATE: Check why the program finished
 	err = cmd.Wait()
-	if err != nil {
+
+	// Did it die because our 5-second context killed it?
+	if ctx.Err() == context.DeadlineExceeded {
+		conn.WriteJSON(WSMessage{Type: "error", Data: "\n\n[SYSTEM] 🛑 Execution terminated: Time Limit Exceeded (5 seconds). Infinite loop detected.\n"})
+	} else if err != nil {
+		// Did it die from a normal compiler error or panic?
 		conn.WriteJSON(WSMessage{Type: "exit", Data: "\n[Process exited with an error]"})
 	} else {
+		// Did it finish naturally?
 		conn.WriteJSON(WSMessage{Type: "exit", Data: "\n[Process finished successfully]"})
 	}
 }
@@ -141,8 +154,6 @@ func main() {
 	}
 
 	http.HandleFunc("/ping", pingHandler)
-
-	// 🚨 THE UPGRADE: The execute route is now a WebSocket connection
 	http.HandleFunc("/execute", wsExecuteHandler)
 
 	fmt.Printf("Go Engine running on port %s\n", port)
