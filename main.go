@@ -138,7 +138,7 @@ func wsExecuteHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Did it die because our 5-second context killed it?
 	if ctx.Err() == context.DeadlineExceeded {
-		conn.WriteJSON(WSMessage{Type: "error", Data: "\n\n[SYSTEM] 🛑 Execution terminated: Max execution time (30 seconds) reached.\n"})
+		conn.WriteJSON(WSMessage{Type: "error", Data: "\n\n[SYSTEM] 🛑 Execution terminated: Max execution time (30 seconds) reached.\nIf its not infinite loop, kindly take your code and run it on your personal pc\n"})
 	} else if err != nil {
 		// Did it die from a normal compiler error or panic?
 		conn.WriteJSON(WSMessage{Type: "exit", Data: "\n[Process exited with an error]"})
