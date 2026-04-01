@@ -70,7 +70,7 @@ func wsExecuteHandler(w http.ResponseWriter, r *http.Request) {
 
 	// 🚨 4. THE BACKEND FIX: Create a 60-second timeout context
 	// 🚨 THE FIX: Increased to 60 seconds to allow for fmt.Scan and human typing
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Second)
 	defer cancel()
 
 	// 🚨 5. THE BACKEND FIX: Attach the context to the command
@@ -138,7 +138,7 @@ func wsExecuteHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Did it die because our 5-second context killed it?
 	if ctx.Err() == context.DeadlineExceeded {
-		conn.WriteJSON(WSMessage{Type: "error", Data: "\n\n[SYSTEM] 🛑 Execution terminated: Max execution time (30 seconds) reached.\nIf its not infinite loop, kindly take your code and run it on your personal pc\n"})
+		conn.WriteJSON(WSMessage{Type: "error", Data: "\n\n[SYSTEM] 🛑 Execution terminated: Max execution time (50 seconds) reached.\nIf its not infinite loop, kindly take your code and run it on your personal pc\n"})
 	} else if err != nil {
 		// Did it die from a normal compiler error or panic?
 		conn.WriteJSON(WSMessage{Type: "exit", Data: "\n[Process exited with an error]"})
